@@ -11,6 +11,8 @@ def build_region_adjacency(N: int = 8, topology: str = "chain", grid_shape=None)
     elif topology == "ring":
         idx = [(i, (i + 1) % N) for i in range(N)]
     elif topology == "grid":
+        if grid_shape is None:
+            raise ValueError("grid_shape must be provided when topology='grid'")
         rows, cols = grid_shape
         assert rows * cols == N
         idx = []
@@ -121,5 +123,5 @@ def generate_dispatch_dataset(n_samples=1000, N=8, T_history=24, T_horizon=6, se
         env_t = _gen_env(N, t_offset=0, rng=rng)
         env_t1 = _gen_env(N, t_offset=1, rng=rng)
 
-        data.append((demand_t, supply_t, env_t, adj, demand_t1, supply_t1, env_t1))
+        data.append((demand_t, supply_t, env_t, adj.clone(), demand_t1, supply_t1, env_t1))
     return data
