@@ -106,7 +106,7 @@ class OrganizationGSRegion(nn.Module):
     def forward(self, phi, area_state, flux, supply, env, adj):
         N = phi.size(0)
         feat = torch.stack([phi.real, phi.imag], dim=1)  # (N, 2)
-        region_predictions = self.demand_head(feat)  # (N, T_horizon)
+        region_predictions = self.demand_head(feat).abs()  # (N, T_horizon) 需求非负
         predicted_demand = region_predictions.mean(dim=1)  # (N,)
         supply_demand_gap = predicted_demand - supply  # (N,)
 
