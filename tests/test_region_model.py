@@ -100,3 +100,76 @@ def test_cell_prev_phi_blend():
     phi2, _, _, _, _ = cell(psi, prev_phi=phi1.detach())
     # 带 prev_phi 应该和没带 prev_phi 的结果不同
     assert not torch.allclose(phi1, phi2)
+
+
+from region_model import OrganizationGSRegion
+
+
+def test_org_output_shapes():
+    adj = build_region_adjacency(N=8, topology="chain")
+    org = OrganizationGSRegion(T_horizon=6)
+    mol = MolecularGSRegion(n_basis=10, T_history=24)
+    cell = CellGSRegion(adj=adj)
+    demand, supply, env, _ = generate_region_scene(N=8, T_history=24, seed=7)
+    psi = mol(torch.tensor(demand), torch.tensor(supply), torch.tensor(env))
+    phi, area, _, _, flux = cell(psi)
+    preds, gap, plan, benefit, events = org(
+        phi, area, flux, torch.tensor(supply), torch.tensor(env), adj
+    )
+    assert preds.shape == (8, 6)
+    assert gap.shape == (8,)
+    assert plan.shape == (8, 8)
+    assert benefit.shape == (1,)
+    assert isinstance(events, dict)
+
+
+def test_org_gap_sign_semantics():
+    """供给很大时 gap 为负（过剩）；供给很小（饥饿）时 gap 为正。"""
+    adj = build_region_adjacency(N=8, topology="chain")
+    org = OrganizationGSRegion(T_horizon=6)
+    mol = MolecularGSRegion(n_basis=10, T_history=24)
+    cell = CellGSRegion(adj=adj)
+    demand, _, env, _ = generate_region_scene(N=8, T_history=24, seed=8)
+    psi = mol(torch.tensor(demand), torch.zeros(8), torch.tensor(env))
+    phi, area, _, _, flux = cell(psi)
+    _, gap, _, _, _ = org(phi, area, flux, torch.zeros(8), torch.tensor(env), adj)
+    # 零供给 → 全部饥饿（gap > 0）
+    assert torch.all(gap > 0)
+    psi = mol(torch.tensor(demand), torch.full((8,), 100.0), torch.tensor(env))
+    phi, area, _, _, flux = cell(psi)
+    _, gap, _, _, _ = org(phi, area, flux, torch.full((8,), 100.0), torch.tensor(env), adj)
+    # 高供给 → 全部过剩（gap < 0）
+    assert torch.all(gap < 0)
+
+
+def test_org_events_triggered():
+    """极端不平衡应该触发 hunger_x 或 oversupply_x 事件。"""
+    adj = build_region_adjacency(N=8, topology="chain")
+    org = OrganizationGSRegion(
+        T_horizon=6, thresholds={"hunger": 1.0, "oversupply": 1.0, "pressure": 0.5},
+    )
+    mol = MolecularGSRegion(n_basis=10, T_history=24)
+    cell = CellGSRegion(adj=adj)
+    demand, _, env, _ = generate_region_scene(N=8, T_history=24, seed=9)
+    psi = mol(torch.tensor(demand), torch.zeros(8), torch.tensor(env))
+    phi, area, _, _, flux = cell(psi)
+    _, _, _, _, events = org(phi, area, flux, torch.zeros(8), torch.tensor(env), adj)
+    hunger_events = [k for k in events if k.startswith("hunger_")]
+    assert len(hunger_events) > 0
+
+
+def test_org_gradient_flow():
+    adj = build_region_adjacency(N=8, topology="chain")
+    org = OrganizationGSRegion(T_horizon=6)
+    mol = MolecularGSRegion(n_basis=10, T_history=24)
+    cell = CellGSRegion(adj=adj)
+    demand, supply, env, _ = generate_region_scene(N=8, T_history=24, seed=10)
+    psi = mol(torch.tensor(demand), torch.tensor(supply), torch.tensor(env))
+    phi, area, _, _, flux = cell(psi)
+    preds, gap, plan, benefit, _ = org(
+        phi, area, flux, torch.tensor(supply), torch.tensor(env), adj
+    )
+    loss = preds.sum() + gap.sum() + plan.sum() + benefit.sum()
+    loss.backward()
+    assert org.demand_head.weight.grad is not None
+    assert org.benefit_head.weight.grad is not None

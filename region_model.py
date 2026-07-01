@@ -87,3 +87,50 @@ class CellGSRegion(nn.Module):
         for k in range(src.size(0)):
             flux[(int(src[k]), int(dst[k]))] = flux_vals[k]
         return latent_state, area_state, j_vals, probs, flux
+
+
+class OrganizationGSRegion(nn.Module):
+    """组织 GS 层：从潜态读出区域预测、缺口、调度收益与调度矩阵。"""
+
+    def __init__(self, T_horizon=6, thresholds=None):
+        super().__init__()
+        self.T_horizon = T_horizon
+        self.thresholds = thresholds or {
+            "hunger": 5.0,
+            "oversupply": 5.0,
+            "pressure": 2.0,
+        }
+        self.demand_head = nn.Linear(2, T_horizon)
+        self.benefit_head = nn.Linear(3, 1)
+
+    def forward(self, phi, area_state, flux, supply, env, adj):
+        N = phi.size(0)
+        feat = torch.stack([phi.real, phi.imag], dim=1)  # (N, 2)
+        region_predictions = self.demand_head(feat)  # (N, T_horizon)
+        predicted_demand = region_predictions.mean(dim=1)  # (N,)
+        supply_demand_gap = predicted_demand - supply  # (N,)
+
+        global_feat = torch.stack(
+            [phi.real.mean(), phi.imag.mean(), area_state.mean()], dim=0
+        )  # (3,)
+        dispatch_benefit = self.benefit_head(global_feat.unsqueeze(0)).squeeze(0)  # (1,)
+
+        # 调度搬运矩阵：把 flux 字典转为密集矩阵，按 outflow 加权
+        # 语义：gap > 0 = 缺车饥饿（需 inflow），gap < 0 = 过剩（需 outflow）
+        outflow = torch.clamp(-supply_demand_gap, min=0)  # (N,) 过剩量（gap<0 → outflow>0）
+        dispatch_plan = torch.zeros(N, N, dtype=torch.float32, device=phi.device)
+        for (r, s), val in flux.items():
+            dispatch_plan[r, s] = torch.abs(val)
+        row_sum = dispatch_plan.sum(dim=1, keepdim=True) + 1e-8
+        dispatch_plan = dispatch_plan / row_sum * outflow.unsqueeze(1)  # 行归一化 × outflow
+
+        # 事件检测：positive gap = hunger, negative gap = oversupply
+        events = {}
+        for r in range(N):
+            if supply_demand_gap[r] > self.thresholds["hunger"]:
+                events[f"hunger_{r}"] = True
+            if supply_demand_gap[r] < -self.thresholds["oversupply"]:
+                events[f"oversupply_{r}"] = True
+            if area_state[r] > self.thresholds["pressure"]:
+                events[f"pressure_{r}"] = True
+        return region_predictions, supply_demand_gap, dispatch_plan, dispatch_benefit, events
