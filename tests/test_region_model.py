@@ -41,3 +41,62 @@ def test_molecular_different_inputs_different_outputs():
     p1 = layer(torch.tensor(d1), torch.tensor(s1), torch.tensor(e1))
     p2 = layer(torch.tensor(d2), torch.tensor(s2), torch.tensor(e2))
     assert not torch.allclose(p1, p2)
+
+
+from region_model import CellGSRegion, MolecularGSRegion
+
+
+def test_cell_output_shapes():
+    adj = build_region_adjacency(N=8, topology="chain")
+    cell = CellGSRegion(adj=adj)
+    mol = MolecularGSRegion(n_basis=10, T_history=24)
+    demand, supply, env, _ = generate_region_scene(N=8, T_history=24, seed=3)
+    psi = mol(torch.tensor(demand), torch.tensor(supply), torch.tensor(env))
+    phi, area, j_vals, probs, flux = cell(psi)
+    E = int(adj.sum())  # 双向边
+    assert phi.shape == (8,)
+    assert phi.dtype == torch.complex64
+    assert area.shape == (8,)
+    assert j_vals.shape == (E,)
+    assert probs.shape == (E, 5)
+    assert len(flux) == E
+    for (r, s), v in flux.items():
+        assert adj[r, s]
+        assert v.dtype == torch.complex64
+
+
+def test_cell_gumbel_softmax_onehot():
+    adj = build_region_adjacency(N=8, topology="chain")
+    cell = CellGSRegion(adj=adj)
+    mol = MolecularGSRegion(n_basis=10, T_history=24)
+    demand, supply, env, _ = generate_region_scene(N=8, T_history=24, seed=4)
+    psi = mol(torch.tensor(demand), torch.tensor(supply), torch.tensor(env))
+    _, _, _, probs, _ = cell(psi)
+    # hard=True 采样下，每行应为 one-hot
+    assert torch.all(probs.sum(dim=-1) - 1.0 < 1e-5)
+    assert torch.all((probs == 0) | (probs == 1) | (probs > 0.999))
+
+
+def test_cell_gradient_flow():
+    adj = build_region_adjacency(N=8, topology="chain")
+    cell = CellGSRegion(adj=adj)
+    mol = MolecularGSRegion(n_basis=10, T_history=24)
+    demand, supply, env, _ = generate_region_scene(N=8, T_history=24, seed=5)
+    psi = mol(torch.tensor(demand), torch.tensor(supply), torch.tensor(env))
+    phi, area, j_vals, probs, flux = cell(psi)
+    loss = torch.abs(phi).sum() + area.sum() + (probs * torch.log(probs + 1e-8)).sum()
+    loss.backward()
+    assert cell.spin_net[0].weight.grad is not None
+    assert cell.phi_update.weight_ih.grad is not None
+
+
+def test_cell_prev_phi_blend():
+    adj = build_region_adjacency(N=8, topology="chain")
+    cell = CellGSRegion(adj=adj)
+    mol = MolecularGSRegion(n_basis=10, T_history=24)
+    demand, supply, env, _ = generate_region_scene(N=8, T_history=24, seed=6)
+    psi = mol(torch.tensor(demand), torch.tensor(supply), torch.tensor(env))
+    phi1, _, _, _, _ = cell(psi, prev_phi=None)
+    phi2, _, _, _, _ = cell(psi, prev_phi=phi1.detach())
+    # 带 prev_phi 应该和没带 prev_phi 的结果不同
+    assert not torch.allclose(phi1, phi2)
