@@ -134,3 +134,59 @@ class OrganizationGSRegion(nn.Module):
             if area_state[r] > self.thresholds["pressure"]:
                 events[f"pressure_{r}"] = True
         return region_predictions, supply_demand_gap, dispatch_plan, dispatch_benefit, events
+
+
+def sech2_regularization(embeddings, prototypes, r_max=5.0, bins=50):
+    """对潜态径向分布施加 sech² 约束。"""
+    loss = 0.0
+    for k in range(prototypes.shape[0]):
+        center = prototypes[k]
+        dist = torch.norm(embeddings - center, dim=1)
+        mask = dist < r_max
+        if mask.sum() < 5:
+            continue
+        dist_vals = dist[mask]
+        hist = torch.histc(dist_vals, bins=bins, min=0, max=r_max)
+        bin_edges = torch.linspace(0, r_max, bins + 1, device=dist.device)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        rho_emp = hist / (hist.sum() * (bin_edges[1] - bin_edges[0]))
+        cumsum = torch.cumsum(hist, dim=0) / (hist.sum() + 1e-8)
+        r_c = bin_centers[torch.argmin(torch.abs(cumsum - 0.5))]
+        if r_c < 0.1:
+            continue
+        rho_theory = (1.0 / (2 * r_c)) * (1 / torch.cosh(bin_centers / r_c)) ** 2
+        rho_theory = rho_theory / (rho_theory.sum() + 1e-8)
+        loss += F.kl_div((rho_emp + 1e-8).log(), rho_theory, reduction="batchmean")
+    return loss
+
+
+class SpinorDispatchEngine(nn.Module):
+    """顶层调度世界模型：三层 GS 串联。"""
+
+    def __init__(self, adj, gamma_cell=1.0, spin_choices=(0, 0.5, 1, 1.5, 2),
+                 n_basis=10, T_history=24, T_horizon=6):
+        super().__init__()
+        self.adj = adj
+        self.molecular = MolecularGSRegion(n_basis=n_basis, T_history=T_history)
+        self.cellular = CellGSRegion(adj=adj, gamma_cell=gamma_cell, spin_choices=spin_choices)
+        self.organization = OrganizationGSRegion(T_horizon=T_horizon)
+        self.prototypes = nn.Parameter(torch.randn(4, 2) * 0.1)
+
+    def forward(self, demand, supply, env, prev_phi=None):
+        psi = self.molecular(demand, supply, env)
+        phi, area, j_vals, probs, flux = self.cellular(psi, prev_phi)
+        preds, gap, plan, benefit, events = self.organization(
+            phi, area, flux, supply, env, self.adj
+        )
+        return DispatchWorldOutput(
+            latent_state=phi,
+            area_state=area,
+            spin_state=j_vals,
+            spin_probabilities=probs,
+            flux_state=flux,
+            region_predictions=preds,
+            supply_demand_gap=gap,
+            dispatch_plan=plan,
+            dispatch_benefit=benefit,
+            events=events,
+        )

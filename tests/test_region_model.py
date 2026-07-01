@@ -173,3 +173,41 @@ def test_org_gradient_flow():
     loss.backward()
     assert org.demand_head.weight.grad is not None
     assert org.benefit_head.weight.grad is not None
+
+
+from region_model import SpinorDispatchEngine
+
+
+def test_engine_forward_returns_dataclass():
+    adj = build_region_adjacency(N=8, topology="chain")
+    model = SpinorDispatchEngine(adj=adj, T_history=24, T_horizon=6)
+    demand, supply, env, _ = generate_region_scene(N=8, T_history=24, seed=11)
+    out = model(
+        torch.tensor(demand), torch.tensor(supply), torch.tensor(env), None,
+    )
+    assert out.__class__.__name__ == "DispatchWorldOutput"
+    assert out.latent_state.shape == (8,)
+    assert out.region_predictions.shape == (8, 6)
+    assert out.dispatch_plan.shape == (8, 8)
+    assert out.area_state.shape == (8,)
+    assert isinstance(out.events, dict)
+    assert isinstance(out.flux_state, dict)
+
+
+def test_engine_parameters_include_all_layers():
+    adj = build_region_adjacency(N=8, topology="chain")
+    model = SpinorDispatchEngine(adj=adj)
+    names = [n for n, _ in model.named_parameters()]
+    assert any("molecular" in n for n in names)
+    assert any("cellular" in n for n in names)
+    assert any("organization" in n for n in names)
+    assert "prototypes" in names
+
+
+def test_engine_prev_phi_carries_through():
+    adj = build_region_adjacency(N=8, topology="chain")
+    model = SpinorDispatchEngine(adj=adj)
+    demand, supply, env, _ = generate_region_scene(N=8, T_history=24, seed=12)
+    out1 = model(torch.tensor(demand), torch.tensor(supply), torch.tensor(env), None)
+    out2 = model(torch.tensor(demand), torch.tensor(supply), torch.tensor(env), out1.latent_state)
+    assert not torch.allclose(out1.latent_state, out2.latent_state)
