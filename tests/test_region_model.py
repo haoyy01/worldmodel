@@ -211,3 +211,64 @@ def test_engine_prev_phi_carries_through():
     out1 = model(torch.tensor(demand), torch.tensor(supply), torch.tensor(env), None)
     out2 = model(torch.tensor(demand), torch.tensor(supply), torch.tensor(env), out1.latent_state)
     assert not torch.allclose(out1.latent_state, out2.latent_state)
+
+
+from region_model import compute_dispatch_losses
+
+
+def test_losses_returns_eight_terms():
+    adj = build_region_adjacency(N=8, topology="chain")
+    model = SpinorDispatchEngine(adj=adj)
+    d1, s1, e1, _ = generate_region_scene(N=8, T_history=24, seed=21)
+    d2, s2, e2, _ = generate_region_scene(N=8, T_history=24, seed=22)
+    batch = (
+        torch.tensor(d1), torch.tensor(s1), torch.tensor(e1),
+        torch.tensor(d2), torch.tensor(s2), torch.tensor(e2),
+    )
+    terms = compute_dispatch_losses(model, batch, gamma_cell=1.0)
+    assert len(terms) == 8  # total + 7 个分量
+    total, loss_pred, loss_demand, loss_gap, loss_benefit, loss_area, loss_spin, loss_bilinear = terms
+    for t in terms:
+        assert torch.isfinite(t)
+        assert t.dim() == 0
+
+
+def test_losses_backward_runs():
+    adj = build_region_adjacency(N=8, topology="chain")
+    model = SpinorDispatchEngine(adj=adj)
+    d1, s1, e1, _ = generate_region_scene(N=8, T_history=24, seed=23)
+    d2, s2, e2, _ = generate_region_scene(N=8, T_history=24, seed=24)
+    batch = (
+        torch.tensor(d1), torch.tensor(s1), torch.tensor(e1),
+        torch.tensor(d2), torch.tensor(s2), torch.tensor(e2),
+    )
+    total, *_ = compute_dispatch_losses(model, batch, gamma_cell=1.0)
+    total.backward()
+    # 验证所有可学习参数都收到了梯度
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None, f"{name} 未收到梯度"
+            assert torch.isfinite(p.grad).all()
+
+
+from region_model import train_dispatch_model
+from region_data import generate_dispatch_dataset
+
+
+def test_train_runs_and_loss_decreases():
+    adj = build_region_adjacency(N=8, topology="chain")
+    model = SpinorDispatchEngine(adj=adj)
+    data = generate_dispatch_dataset(n_samples=40, N=8, T_history=24, T_horizon=6, seed_base=0)
+    metrics = train_dispatch_model(model, data, epochs=5, batch_size=8, lr=1e-2)
+    assert len(metrics) == 5
+    assert all(m == m for m in metrics)  # no NaN
+    assert metrics[-1] < metrics[0]  # 单调下降（5 epoch 内应明显）
+
+
+def test_train_no_nan_in_params():
+    adj = build_region_adjacency(N=8, topology="chain")
+    model = SpinorDispatchEngine(adj=adj)
+    data = generate_dispatch_dataset(n_samples=20, N=8, T_history=24, T_horizon=6, seed_base=0)
+    train_dispatch_model(model, data, epochs=2, batch_size=4)
+    for name, p in model.named_parameters():
+        assert torch.isfinite(p).all(), f"{name} 含 NaN/Inf"

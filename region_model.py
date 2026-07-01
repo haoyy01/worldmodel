@@ -144,15 +144,21 @@ def sech2_regularization(embeddings, prototypes, r_max=5.0, bins=50):
         dist = torch.norm(embeddings - center, dim=1)
         mask = dist < r_max
         if mask.sum() < 5:
+            loss = loss + dist.mean() * 0.01
             continue
         dist_vals = dist[mask]
-        hist = torch.histc(dist_vals, bins=bins, min=0, max=r_max)
         bin_edges = torch.linspace(0, r_max, bins + 1, device=dist.device)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        bin_width = bin_edges[1] - bin_edges[0]
+        # 软直方图（可微）：三角核替代 torch.histc，使梯度能回流至 prototypes
+        diffs = dist_vals.unsqueeze(1) - bin_centers.unsqueeze(0)  # (M, bins)
+        soft_weights = torch.relu(1 - torch.abs(diffs) / bin_width)  # 三角核
+        hist = soft_weights.sum(dim=0)  # (bins,)
         rho_emp = hist / (hist.sum() * (bin_edges[1] - bin_edges[0]))
         cumsum = torch.cumsum(hist, dim=0) / (hist.sum() + 1e-8)
         r_c = bin_centers[torch.argmin(torch.abs(cumsum - 0.5))]
         if r_c < 0.1:
+            loss = loss + dist.mean() * 0.01
             continue
         rho_theory = (1.0 / (2 * r_c)) * (1 / torch.cosh(bin_centers / r_c)) ** 2
         rho_theory = rho_theory / (rho_theory.sum() + 1e-8)
@@ -190,3 +196,92 @@ class SpinorDispatchEngine(nn.Module):
             dispatch_benefit=benefit,
             events=events,
         )
+
+
+def compute_dispatch_losses(
+    model, batch_data, gamma_cell,
+    alpha_pred=1.0, alpha_demand=0.5, alpha_gap=0.5, alpha_benefit=0.3,
+    alpha_area=0.1, beta_spin=0.01, gamma_sech2=0.05, delta_bilinear=0.01,
+    transfer_lambda=0.01,
+):
+    """计算 8 项损失。批量数据为单样本（与现有 train_model 风格一致）。"""
+    demand_t, supply_t, env_t, demand_t1, supply_t1, env_t1 = batch_data
+
+    # 前向 t
+    out_t = model(demand_t, supply_t, env_t)
+    # 前向 t1（带 prev_phi）
+    out_t1 = model(demand_t1, supply_t1, env_t1, prev_phi=out_t.latent_state.detach())
+
+    # ① 潜态预测损失：模型演化结果 vs 真实新分子编码
+    psi_next_true = model.molecular(demand_t1, supply_t1, env_t1)
+    loss_pred = torch.mean(torch.abs(out_t1.latent_state - psi_next_true) ** 2)
+
+    # ② 需求序列预测损失
+    loss_demand = F.mse_loss(out_t.region_predictions, demand_t1[:, :out_t.region_predictions.size(1)])
+
+    # ③ 供需缺口损失（真实 gap = mean(demand_t1) - supply_t）
+    true_gap = demand_t1.mean(dim=1) - supply_t
+    loss_gap = F.mse_loss(out_t.supply_demand_gap, true_gap)
+
+    # ④ 调度收益损失
+    true_benefit = torch.relu(-true_gap).sum() - transfer_lambda * out_t.dispatch_plan.abs().sum()
+    loss_benefit = F.mse_loss(out_t.dispatch_benefit, true_benefit.unsqueeze(0))
+
+    # ⑤ 面积算子正则
+    target_area = torch.zeros_like(out_t.area_state)
+    loss_area = ((out_t.area_state - gamma_cell * target_area) ** 2).sum()
+
+    # ⑥ 自旋熵
+    probs = out_t.spin_probabilities
+    loss_spin = (probs * torch.log(probs + 1e-8)).sum()
+
+    # ⑦ sech² 正则
+    loss_sech2 = sech2_regularization(
+        out_t.latent_state.real.unsqueeze(1), model.prototypes, r_max=5.0
+    )
+
+    # ⑧ 双线性型（通量反对称）
+    loss_bilinear = 0.0
+    for (r, s), val in out_t.flux_state.items():
+        if (s, r) in out_t.flux_state:
+            loss_bilinear = loss_bilinear + torch.abs(val + out_t.flux_state[(s, r)].conj()) ** 2
+
+    total = (
+        alpha_pred * loss_pred + alpha_demand * loss_demand
+        + alpha_gap * loss_gap + alpha_benefit * loss_benefit
+        + alpha_area * loss_area + beta_spin * loss_spin
+        + gamma_sech2 * loss_sech2 + delta_bilinear * loss_bilinear
+    )
+    return total, loss_pred, loss_demand, loss_gap, loss_benefit, loss_area, loss_spin, loss_bilinear
+
+
+def train_dispatch_model(model, train_data, epochs=10, batch_size=32, lr=1e-3):
+    """单样本前向 + 单次 backward 训练。返回每个 epoch 的平均 loss 列表。"""
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    metrics = []
+    for epoch in range(epochs):
+        np.random.shuffle(train_data)
+        total_loss = 0.0
+        for i in range(0, len(train_data), batch_size):
+            batch = train_data[i:i + batch_size]
+            for sample in batch:
+                demand_t, supply_t, env_t, adj, demand_t1, supply_t1, env_t1 = sample
+                # adj 应与模型内置 adj 一致（使用 model.adj）
+                batch_tensors = (
+                    torch.tensor(demand_t, dtype=torch.float32),
+                    torch.tensor(supply_t, dtype=torch.float32),
+                    torch.tensor(env_t, dtype=torch.float32),
+                    torch.tensor(demand_t1, dtype=torch.float32),
+                    torch.tensor(supply_t1, dtype=torch.float32),
+                    torch.tensor(env_t1, dtype=torch.float32),
+                )
+                loss, *_ = compute_dispatch_losses(model, batch_tensors, gamma_cell=1.0)
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                total_loss += loss.item()
+        avg = total_loss / len(train_data)
+        metrics.append(avg)
+        print(f"Epoch {epoch + 1}, Loss: {avg:.4f}")
+    return metrics
