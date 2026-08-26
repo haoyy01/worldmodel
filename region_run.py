@@ -56,8 +56,8 @@ def simulate_dispatch(model, duration=10, dt=1):
 def run():
     adj = build_region_adjacency(N=8, topology="chain")
     model = SpinorDispatchEngine(adj=adj, T_history=24, T_horizon=6)
-    data = generate_dispatch_dataset(n_samples=100, N=8, T_history=24, T_horizon=6, seed_base=0)
-    train_dispatch_model(model, data, epochs=3, batch_size=16, lr=1e-2)
+    data = generate_dispatch_dataset(n_samples=500, N=8, T_history=24, T_horizon=6, seed_base=0)
+    train_dispatch_model(model, data, epochs=20, batch_size=16, lr=5e-3)
     print("=" * 60)
     print("Training complete. Starting dispatch simulation...")
     print("=" * 60)

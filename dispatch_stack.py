@@ -12,9 +12,12 @@ class DispatchPolicyPlanner:
         gap = world_output.supply_demand_gap
         pressure = world_output.area_state
         benefit = world_output.dispatch_benefit
-        if benefit < -5.0 or gap.abs().max() > 10.0:
+        # 判断是否有可搬运的过剩量（outflow > 0 的区域）
+        outflow = torch.clamp(-gap, min=0)
+        has_outflow = outflow.max().item() > 0.5
+        if (benefit < -5.0 or gap.abs().max() > 10.0) and has_outflow:
             mode = "emergency_rebalance"
-        elif pressure.max() > 3.0 or gap.abs().max() > 5.0:
+        elif (pressure.max() > 3.0 or gap.abs().max() > 5.0) and has_outflow:
             mode = "rebalance"
         else:
             mode = "routine"
@@ -39,7 +42,9 @@ class DispatchSolver:
         row_sum = plan.sum(dim=1, keepdim=True) + 1e-8
         scale = torch.clamp(self.cap_per_region / row_sum, max=1.0)
         plan = plan * scale
-        int_plan = torch.round(plan).to(torch.int32)
+        # 极小值归零（避免 ceil 把 0.01 变成 1）
+        plan = torch.where(plan < 0.5, torch.zeros_like(plan), plan)
+        int_plan = torch.ceil(plan).to(torch.int32)
         # 工人数：每个区域搬出量除以每车容量
         workers = (int_plan.sum(dim=1) // 3).to(torch.int32)
         routes = []
@@ -79,18 +84,17 @@ class ConstraintGuard:
         self.max_capacity = max_capacity
 
     def apply(self, world_output, command):
-        # 估算当前供给（不知道真实 supply，用 gap 反推不严谨，这里仅用 transfer 限幅）
-        # 由于 world_output 不直接含 supply，简化：用 transfer_matrix 自身做守恒检查
         transfer = command.transfer_matrix.clone()
         out_total = transfer.sum(dim=1)
         alerts = []
+        supply = world_output.supply
 
-        # 若某区域搬出过度，限幅
-        ref = world_output.dispatch_plan.sum(dim=1)
         violation = False
         for r in range(transfer.size(0)):
-            if out_total[r].item() > ref[r].item() + 5 and ref[r].item() < 5:
-                transfer[r, :] = torch.round(world_output.dispatch_plan[r, :]).to(transfer.dtype)
+            max_out = (supply[r] - self.min_keep).clamp(min=0).item()
+            if out_total[r].item() > max_out:
+                scale = max_out / (out_total[r].item() + 1e-8)
+                transfer[r, :] = (transfer[r, :] * scale).round()
                 violation = True
                 alerts.append(f"oversend_limited_{r}")
 

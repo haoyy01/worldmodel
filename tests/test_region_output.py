@@ -25,10 +25,12 @@ def test_dispatch_world_output_fields():
         dispatch_plan=torch.zeros(8, 8),
         dispatch_benefit=torch.zeros(1),
         events={},
+        supply=torch.zeros(8),
     )
     assert out.latent_state.dtype == torch.complex64
     assert out.region_predictions.shape == (8, 6)
     assert out.dispatch_plan.shape == (8, 8)
+    assert out.supply.shape == (8,)
 
 
 def test_dispatch_plan_frozen():

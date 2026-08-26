@@ -144,8 +144,10 @@ WorldModelOutput（dataclass）
    Φ_rs = γ · √(j(j+1)) · exp(i·(angle(φ_s) - angle(φ_r)))
    物理含义: |Φ_rs| 大=调度量大, 相位差=流向
 
-4. 面积算子 = 区域压力
-   A_r = Σ_{与 r 相关的边} |Φ|²
+4. 面积算子 = 区域压力（按度数归一化）
+   A_r = (Σ_{与 r 相关的边} |Φ|²) / degree(r)
+   degree(r) = adj 中 r 的邻居数
+   归一化消除"内部节点天然比端点压力大"的度数偏差
 
 5. 节点演化
    对每个区域 r:
@@ -187,7 +189,7 @@ WorldModelOutput（dataclass）
 | 参数 | 形状 | 拟合目标 |
 |---|---|---|
 | `demand_head` | Linear(8, T_horizon) | 用 φ_r.real+φ_r.imag (8 维) 预测需求序列 |
-| `benefit_head` | Linear(9, 1) | 用区域潜态均值(8 维)+压力均值(1 维)预测全局调度收益 |
+| `benefit_head` | Linear(5, 1) | 用区域潜态均值(2 维)+压力均值(1 维)+缺口均值(1 维)+供给均值(1 维)预测全局调度收益 |
 ### 读出逻辑
 ```
 1. 区域状态预测
@@ -200,7 +202,7 @@ WorldModelOutput（dataclass）
    正值 = 缺车（饥饿），负值 = 过剩
 
 3. 调度收益
-   global_feat = concat(mean(feat over N), mean(A)) (9,)
+   global_feat = concat(mean(phi.real), mean(phi.imag), mean(A), mean(gap), mean(supply)) (5,)
    dispatch_benefit = benefit_head(global_feat)
 
 4. 调度搬运计划
@@ -320,14 +322,16 @@ FleetController        (~ LowLevelController)
   │ raw commands
   ▼
 ConstraintGuard        (~ SafetySupervisor)
-  检查可行性: 不超区域容量、不反向溢出、满足最小保有量
-  若违反限幅或触发 alert
+   检查可行性: 不超区域容量、不反向溢出、满足最小保有量
+   用 WorldOutput.supply 检查搬出量 ≤ supply - min_keep
+   若违反限幅或触发 alert
   │ safe schedule
   ▼
 执行或下发
 ```
 
 ### 输出 dataclass (`region_output.py`)
+- `DispatchWorldOutput`: latent_state, area_state, spin_state, spin_probabilities, flux_state, region_predictions, supply_demand_gap, dispatch_plan, dispatch_benefit, events, **supply** (N,)
 - `DispatchPlan`: transfer_matrix, benefit_estimate, events
 - `DispatchPolicy`: mode, rebalance_priority, target_supply
 - `DispatchSchedule`: transfer_matrix(int), workers_needed, routes

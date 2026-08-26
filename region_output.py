@@ -17,6 +17,7 @@ class DispatchWorldOutput:
     dispatch_plan: torch.Tensor         # (N, N)
     dispatch_benefit: torch.Tensor      # (1,)
     events: dict[str, bool]
+    supply: torch.Tensor                # (N,) float32
 
 
 @dataclass(frozen=True, slots=True)

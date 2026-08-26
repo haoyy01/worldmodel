@@ -48,6 +48,9 @@ class CellGSRegion(nn.Module):
         src, dst = torch.where(adj)
         self.register_buffer("src_idx", src)
         self.register_buffer("dst_idx", dst)
+        degree = adj.sum(dim=1).float()
+        degree = torch.clamp(degree, min=1.0)
+        self.register_buffer("degree", degree)
         self.spin_net = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, len(spin_choices)))
         self.phi_update = nn.GRUCell(4, 4)
 
@@ -72,6 +75,7 @@ class CellGSRegion(nn.Module):
         area_state = torch.zeros(N, dtype=torch.float32, device=phi.device)
         area_state.scatter_add_(0, src, contrib)
         area_state.scatter_add_(0, dst, contrib)
+        area_state = area_state / self.degree
         # 节点演变：入边通量聚合 + GRUCell 批量更新
         agg_real = torch.zeros(N, dtype=torch.float32, device=phi.device)
         agg_imag = torch.zeros(N, dtype=torch.float32, device=phi.device)
@@ -98,10 +102,10 @@ class OrganizationGSRegion(nn.Module):
         self.thresholds = thresholds or {
             "hunger": 5.0,
             "oversupply": 5.0,
-            "pressure": 2.0,
+            "pressure": 0.5,
         }
         self.demand_head = nn.Linear(2, T_horizon)
-        self.benefit_head = nn.Linear(3, 1)
+        self.benefit_head = nn.Linear(5, 1)
 
     def forward(self, phi, area_state, flux, supply, env, adj):
         N = phi.size(0)
@@ -111,8 +115,9 @@ class OrganizationGSRegion(nn.Module):
         supply_demand_gap = predicted_demand - supply  # (N,)
 
         global_feat = torch.stack(
-            [phi.real.mean(), phi.imag.mean(), area_state.mean()], dim=0
-        )  # (3,)
+            [phi.real.mean(), phi.imag.mean(), area_state.mean(),
+             supply_demand_gap.mean(), supply.mean()], dim=0
+        )  # (5,)
         dispatch_benefit = self.benefit_head(global_feat.unsqueeze(0)).squeeze(0)  # (1,)
 
         # 调度搬运矩阵：把 flux 字典转为密集矩阵，按 outflow 加权
@@ -195,6 +200,7 @@ class SpinorDispatchEngine(nn.Module):
             dispatch_plan=plan,
             dispatch_benefit=benefit,
             events=events,
+            supply=supply,
         )
 
 

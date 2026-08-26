@@ -33,8 +33,8 @@ def test_policy_planner_modes():
     assert policy.target_supply.shape == (8,)
 
 
-def test_policy_planner_emergency_on_hunger():
-    """构造极端 gap 场景，验证 emergency_rebalance 被触发。"""
+def test_policy_planner_emergency_on_oversupply():
+    """构造极端过剩场景（有 outflow），验证 emergency_rebalance 被触发。"""
     from region_output import DispatchWorldOutput
     planner = DispatchPolicyPlanner()
     out = DispatchWorldOutput(
@@ -44,13 +44,35 @@ def test_policy_planner_emergency_on_hunger():
         spin_probabilities=torch.zeros(10, 5),
         flux_state={},
         region_predictions=torch.zeros(8, 6),
-        supply_demand_gap=torch.full((8,), 20.0),  # 极端饥饿
+        supply_demand_gap=torch.full((8,), -20.0),  # 极端过剩（有车可搬）
         dispatch_plan=torch.zeros(8, 8),
-        dispatch_benefit=torch.tensor([-8.0]),  # benefit 极差
+        dispatch_benefit=torch.tensor([-8.0]),
         events={},
+        supply=torch.full((8,), 50.0),
     )
     policy = planner.plan(out)
     assert policy.mode == "emergency_rebalance"
+
+
+def test_policy_planner_routine_on_all_hunger():
+    """全饥饿（无 outflow）时即使 gap 大也应降级为 routine（无车可搬）。"""
+    from region_output import DispatchWorldOutput
+    planner = DispatchPolicyPlanner()
+    out = DispatchWorldOutput(
+        latent_state=torch.zeros(8, dtype=torch.complex64),
+        area_state=torch.full((8,), 5.0),
+        spin_state=torch.zeros(10),
+        spin_probabilities=torch.zeros(10, 5),
+        flux_state={},
+        region_predictions=torch.zeros(8, 6),
+        supply_demand_gap=torch.full((8,), 20.0),  # 全饥饿
+        dispatch_plan=torch.zeros(8, 8),
+        dispatch_benefit=torch.tensor([-8.0]),
+        events={},
+        supply=torch.zeros(8),
+    )
+    policy = planner.plan(out)
+    assert policy.mode == "routine"
 
 
 def test_solver_output_int():
@@ -65,13 +87,13 @@ def test_solver_output_int():
 
 
 def test_solver_capacity_constraint():
-    """搬出量大致不超过 cap_per_region（允许取整误差 ±2）。"""
+    """搬出量大致不超过 cap_per_region（允许 ceil 取整误差 +2）。"""
     solver = DispatchSolver(cap_per_region=10)
     _, out = _make_output(seed=34, supply_val=100.0)
     schedule = solver.solve(out)
-    # 每个 source 的搬出量基本不超过 cap_per_region（允许少量取整误差）
+    # 每个 source 的搬出量基本不超过 cap_per_region（ceil 可能多 +E 个邻居数）
     out_per_region = schedule.transfer_matrix.sum(dim=1)
-    assert torch.all(out_per_region <= 12)
+    assert torch.all(out_per_region <= 14)  # cap 10 + ceil 误差 4 (最多4个邻居)
 
 
 def test_fleet_controller_assigns_workers():
@@ -100,8 +122,8 @@ def test_constraint_guard_returns_safe_state():
 
 def test_constraint_guard_blocks_oversend():
     """如果调度搬出超过区域内保有量下限，guard 应限幅。"""
-    guard = ConstraintGuard(min_keep=5, max_capacity=200)
-    # 构造一个极端搬出场景
+    guard = ConstraintGuard(min_keep=2, max_capacity=200)
+    # 构造一个极端搬出场景：supply=3, min_keep=2 → max_out=1
     _, out = _make_output(seed=37, supply_val=3.0)
     # 模拟一个搬出过度的命令
     cmd_over = type("C", (), {})()
@@ -112,6 +134,6 @@ def test_constraint_guard_blocks_oversend():
     state, safe = guard.apply(out, cmd_over)
     # guard 应触发干预
     assert state.intervention is True
-    # 搬出后区域 0 的剩余车辆数 >= 0
-    remaining_0 = 3 - safe.transfer_matrix[0, :].sum().item()
-    assert remaining_0 >= 0  # 至少不变成负数
+    # 搬出后区域 0 的剩余车辆数 >= min_keep
+    remaining_0 = out.supply[0].item() - safe.transfer_matrix[0, :].sum().item()
+    assert remaining_0 >= 2 - 1  # 允许取整误差 ±1
